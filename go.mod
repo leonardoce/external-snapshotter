@@ -6,6 +6,7 @@ require (
 	github.com/container-storage-interface/spec v1.9.0
 	github.com/evanphx/json-patch v5.9.0+incompatible
 	github.com/fsnotify/fsnotify v1.7.0
+	github.com/go-openapi/jsonpointer v0.21.0
 	github.com/golang/mock v1.6.0
 	github.com/google/gofuzz v1.2.0
 	github.com/kubernetes-csi/csi-lib-utils v0.18.0
@@ -33,7 +34,6 @@ require (
 	github.com/emicklei/go-restful/v3 v3.12.0 // indirect
 	github.com/go-logr/logr v1.4.1 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
-	github.com/go-openapi/jsonpointer v0.21.0 // indirect
 	github.com/go-openapi/jsonreference v0.21.0 // indirect
 	github.com/go-openapi/swag v0.23.0 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
