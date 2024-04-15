@@ -35,6 +35,13 @@ import (
 	"github.com/kubernetes-csi/external-snapshotter/v7/pkg/utils"
 )
 
+// snapshotInfo contains the basic information
+// about a snapshotted volume
+type snapshotInfo struct {
+	snapshotContentName string
+	volumeHandle        string
+}
+
 func (ctrl *csiSnapshotSideCarController) storeGroupSnapshotContentUpdate(groupSnapshotContent interface{}) (bool, error) {
 	return utils.StoreObjectUpdate(ctrl.groupSnapshotContentStore, groupSnapshotContent, "groupsnapshotcontent")
 }
@@ -430,7 +437,7 @@ func (ctrl *csiSnapshotSideCarController) createGroupSnapshotWrapper(groupSnapsh
 		return groupSnapshotContent, fmt.Errorf("failed to get secret reference for group snapshot content %s: %v", groupSnapshotContent.Name, err)
 	}
 	// Create individual snapshots and snapshot contents
-	var snapshotContentNames []string
+	var snapshotsInfo []snapshotInfo
 	for _, snapshot := range snapshots {
 		volumeSnapshotContentName := GetSnapshotContentNameForVolumeGroupSnapshotContent(string(groupSnapshotContent.UID), snapshot.SourceVolumeId)
 		volumeSnapshotName := GetSnapshotNameForVolumeGroupSnapshotContent(string(groupSnapshotContent.UID), snapshot.SourceVolumeId)
@@ -484,7 +491,10 @@ func (ctrl *csiSnapshotSideCarController) createGroupSnapshotWrapper(groupSnapsh
 		if err != nil {
 			return groupSnapshotContent, err
 		}
-		snapshotContentNames = append(snapshotContentNames, vsc.Name)
+		snapshotsInfo = append(snapshotsInfo, snapshotInfo{
+			snapshotContentName: vsc.Name,
+			volumeHandle:        snapshot.SourceVolumeId,
+		})
 
 		_, err = ctrl.clientset.SnapshotV1().VolumeSnapshots(volumeSnapshotNamespace).Create(context.TODO(), volumeSnapshot, metav1.CreateOptions{})
 		if err != nil {
@@ -497,7 +507,7 @@ func (ctrl *csiSnapshotSideCarController) createGroupSnapshotWrapper(groupSnapsh
 		}
 	}
 
-	newGroupSnapshotContent, err := ctrl.updateGroupSnapshotContentStatus(groupSnapshotContent, groupSnapshotID, readyToUse, creationTime.UnixNano(), snapshotContentNames)
+	newGroupSnapshotContent, err := ctrl.updateGroupSnapshotContentStatus(groupSnapshotContent, groupSnapshotID, readyToUse, creationTime.UnixNano(), snapshotsInfo)
 	if err != nil {
 		klog.Errorf("error updating status for volume group snapshot content %s: %v.", groupSnapshotContent.Name, err)
 		return groupSnapshotContent, fmt.Errorf("error updating status for volume group snapshot content %s: %v", groupSnapshotContent.Name, err)
@@ -633,12 +643,32 @@ func (ctrl *csiSnapshotSideCarController) updateGroupSnapshotContentStatus(
 	groupSnapshotHandle string,
 	readyToUse bool,
 	createdAt int64,
-	snapshotContentNames []string) (*crdv1alpha1.VolumeGroupSnapshotContent, error) {
+	snapshots []snapshotInfo,
+) (*crdv1alpha1.VolumeGroupSnapshotContent, error) {
 	klog.V(5).Infof("updateGroupSnapshotContentStatus: updating VolumeGroupSnapshotContent [%s], groupSnapshotHandle %s, readyToUse %v, createdAt %v", groupSnapshotContent.Name, groupSnapshotHandle, readyToUse, createdAt)
 
 	groupSnapshotContentObj, err := ctrl.clientset.GroupsnapshotV1alpha1().VolumeGroupSnapshotContents().Get(context.TODO(), groupSnapshotContent.Name, metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("error get group snapshot content %s from api server: %v", groupSnapshotContent.Name, err)
+	}
+
+	var snapshotInfoList utils.SnapshotInfoList
+	if metav1.HasAnnotation(groupSnapshotContent.ObjectMeta, utils.AnnSnapshotInfo) {
+		snapshotInfoList, err = utils.SnapshotInfoFromJSON(groupSnapshotContent.Annotations[utils.AnnSnapshotInfo])
+		if err != nil {
+			klog.V(1).Infof(
+				"updateGroupSnapshotContentStatus[%s]: the content of the [%s] annotation is not valid: %s",
+				groupSnapshotContent.Name,
+				utils.AnnSnapshotInfo,
+				err.Error(),
+			)
+		}
+	} else {
+		klog.V(2).Infof(
+			"updateGroupSnapshotContentStatus[%s]: the [%s] annotation is empty, we won't be able to associate PVs",
+			groupSnapshotContent.Name,
+			utils.AnnSnapshotInfo,
+		)
 	}
 
 	var newStatus *crdv1alpha1.VolumeGroupSnapshotContentStatus
@@ -649,9 +679,10 @@ func (ctrl *csiSnapshotSideCarController) updateGroupSnapshotContentStatus(
 			ReadyToUse:                &readyToUse,
 			CreationTime:              &createdAt,
 		}
-		for _, name := range snapshotContentNames {
+		for _, snapshot := range snapshots {
 			newStatus.PVVolumeSnapshotContentRefList = append(newStatus.PVVolumeSnapshotContentRefList, crdv1alpha1.PVVolumeSnapshotContentPair{
-				VolumeSnapshotContentName: name,
+				VolumeSnapshotContentName: snapshot.snapshotContentName,
+				PersistentVolumeName:      snapshotInfoList.GetFromVolumeHandle(snapshot.volumeHandle).PVName,
 			})
 		}
 		updated = true
@@ -673,9 +704,10 @@ func (ctrl *csiSnapshotSideCarController) updateGroupSnapshotContentStatus(
 			updated = true
 		}
 		if len(newStatus.PVVolumeSnapshotContentRefList) == 0 {
-			for _, name := range snapshotContentNames {
+			for _, snapshot := range snapshots {
 				newStatus.PVVolumeSnapshotContentRefList = append(newStatus.PVVolumeSnapshotContentRefList, crdv1alpha1.PVVolumeSnapshotContentPair{
-					VolumeSnapshotContentName: name,
+					VolumeSnapshotContentName: snapshot.snapshotContentName,
+					PersistentVolumeName:      snapshotInfoList.GetFromVolumeHandle(snapshot.volumeHandle).PVName,
 				})
 			}
 			updated = true
@@ -838,7 +870,7 @@ func (ctrl *csiSnapshotSideCarController) checkandUpdateGroupSnapshotContentStat
 		}
 
 		// TODO: Get a reference to snapshot contents for this volume group snapshot
-		updatedContent, err := ctrl.updateGroupSnapshotContentStatus(groupSnapshotContent, groupSnapshotID, readyToUse, creationTime.UnixNano(), []string{})
+		updatedContent, err := ctrl.updateGroupSnapshotContentStatus(groupSnapshotContent, groupSnapshotID, readyToUse, creationTime.UnixNano(), []snapshotInfo{})
 		if err != nil {
 			return groupSnapshotContent, err
 		}

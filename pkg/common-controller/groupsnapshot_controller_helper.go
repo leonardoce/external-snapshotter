@@ -564,15 +564,40 @@ func (ctrl *csiSnapshotCommonController) updateGroupSnapshotStatus(groupSnapshot
 		volumeSnapshotErr = groupSnapshotContent.Status.Error.DeepCopy()
 	}
 
+	var snapshotInfoList utils.SnapshotInfoList
+	if metav1.HasAnnotation(groupSnapshotContent.ObjectMeta, utils.AnnSnapshotInfo) {
+		var err error
+		snapshotInfoList, err = utils.SnapshotInfoFromJSON(groupSnapshotContent.Annotations[utils.AnnSnapshotInfo])
+		if err != nil {
+			klog.V(1).Infof(
+				"updateGroupSnapshotStatus[%s]: the content of the [%s] annotation is not valid: %s",
+				groupSnapshotContent.Name,
+				utils.AnnSnapshotInfo,
+				err.Error(),
+			)
+		}
+	} else {
+		klog.V(2).Infof(
+			"updateGroupSnapshotStatus[%s]: the [%s] annotation is empty, we won't be able to associate PVs",
+			groupSnapshotContent.Name,
+			utils.AnnSnapshotInfo,
+		)
+	}
+
 	var pvcVolumeSnapshotRefList []crdv1alpha1.PVCVolumeSnapshotPair
 	if groupSnapshotContent.Status != nil && len(groupSnapshotContent.Status.PVVolumeSnapshotContentRefList) != 0 {
 		for _, contentRef := range groupSnapshotContent.Status.PVVolumeSnapshotContentRefList {
-			groupSnapshotContent, err := ctrl.contentLister.Get(contentRef.VolumeSnapshotContentName)
+			volumeSnapshotContent, err := ctrl.contentLister.Get(contentRef.VolumeSnapshotContentName)
 			if err != nil {
 				return nil, fmt.Errorf("failed to get group snapshot content %s from group snapshot content store: %v", contentRef.VolumeSnapshotContentName, err)
 			}
 			pvcVolumeSnapshotRefList = append(pvcVolumeSnapshotRefList, crdv1alpha1.PVCVolumeSnapshotPair{
-				VolumeSnapshotRef: groupSnapshotContent.Spec.VolumeSnapshotRef,
+				VolumeSnapshotRef: volumeSnapshotContent.Spec.VolumeSnapshotRef,
+				PersistentVolumeClaimRef: v1.ObjectReference{
+					Namespace: groupSnapshot.Namespace,
+					Name:      snapshotInfoList.GetFromPVName(contentRef.PersistentVolumeName).PVCName,
+					Kind:      "PersistentVolumeClaim",
+				},
 			})
 		}
 	}
@@ -755,6 +780,7 @@ func (ctrl *csiSnapshotCommonController) createGroupSnapshotContent(groupSnapsho
 		return nil, err
 	}
 	var volumeHandles []string
+	var snapshotInfos utils.SnapshotInfoList
 	for _, pv := range volumes {
 		if pv.Spec.CSI == nil {
 			err := fmt.Errorf(
@@ -769,7 +795,19 @@ func (ctrl *csiSnapshotCommonController) createGroupSnapshotContent(groupSnapsho
 			)
 			return nil, err
 		}
-		volumeHandles = append(volumeHandles, pv.Spec.CSI.VolumeHandle)
+
+		pvcName := ""
+		if pv.Spec.ClaimRef != nil {
+			pvcName = pv.Spec.ClaimRef.Name
+		}
+
+		volumeHandle := pv.Spec.CSI.VolumeHandle
+		volumeHandles = append(volumeHandles, volumeHandle)
+		snapshotInfos = append(snapshotInfos, utils.SnapshotInfo{
+			VolumeHandle: volumeHandle,
+			PVName:       pv.Name,
+			PVCName:      pvcName,
+		})
 	}
 
 	groupSnapshotContent := &crdv1alpha1.VolumeGroupSnapshotContent{
@@ -786,6 +824,18 @@ func (ctrl *csiSnapshotCommonController) createGroupSnapshotContent(groupSnapsho
 			Driver:                       groupSnapshotClass.Driver,
 		},
 	}
+
+	/* Add snapshot information as an annotation */
+	jsonInfo, err := snapshotInfos.ToJSON()
+	if err != nil {
+		strerr := fmt.Errorf("Error while setting PV names annotation %s: %v", utils.GroupSnapshotKey(groupSnapshot), err)
+		return nil, newControllerUpdateError(utils.GroupSnapshotKey(groupSnapshot), strerr.Error())
+	}
+
+	klog.V(5).Infof(
+		"createGroupSnapshotContent: set annotation [%s] on volume group snapshot content [%s].",
+		utils.AnnSnapshotInfo, utils.GroupSnapshotKey(groupSnapshot))
+	metav1.SetMetaDataAnnotation(&groupSnapshotContent.ObjectMeta, utils.AnnSnapshotInfo, jsonInfo)
 
 	/*
 		Add secret reference details
