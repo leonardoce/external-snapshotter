@@ -652,23 +652,9 @@ func (ctrl *csiSnapshotSideCarController) updateGroupSnapshotContentStatus(
 		return nil, fmt.Errorf("error get group snapshot content %s from api server: %v", groupSnapshotContent.Name, err)
 	}
 
-	var snapshotInfoList utils.SnapshotInfoList
-	if metav1.HasAnnotation(groupSnapshotContent.ObjectMeta, utils.AnnSnapshotInfo) {
-		snapshotInfoList, err = utils.SnapshotInfoFromJSON(groupSnapshotContent.Annotations[utils.AnnSnapshotInfo])
-		if err != nil {
-			klog.V(1).Infof(
-				"updateGroupSnapshotContentStatus[%s]: the content of the [%s] annotation is not valid: %s",
-				groupSnapshotContent.Name,
-				utils.AnnSnapshotInfo,
-				err.Error(),
-			)
-		}
-	} else {
-		klog.V(2).Infof(
-			"updateGroupSnapshotContentStatus[%s]: the [%s] annotation is empty, we won't be able to associate PVs",
-			groupSnapshotContent.Name,
-			utils.AnnSnapshotInfo,
-		)
+	pvs, err := ctrl.client.CoreV1().PersistentVolumes().List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("error get PersistentVolumes list from API server: %v", err)
 	}
 
 	var newStatus *crdv1alpha1.VolumeGroupSnapshotContentStatus
@@ -680,12 +666,23 @@ func (ctrl *csiSnapshotSideCarController) updateGroupSnapshotContentStatus(
 			CreationTime:              &createdAt,
 		}
 		for _, snapshotContentLink := range snapshotContentLinks {
+			pv := utils.GetPersistentVolumeFromHandle(pvs, groupSnapshotContent.Spec.Driver, snapshotContentLink.volumeHandle)
+			pvName := ""
+			if pv != nil {
+				pvName = pv.Name
+			} else {
+				klog.V(5).Infof(
+					"updateGroupSnapshotContentStatus: unable to find PV for volumeHandle:[%s] and CSI driver:[%s]",
+					snapshotContentLink.volumeHandle,
+					groupSnapshotContent.Spec.Driver)
+			}
+
 			newStatus.PVVolumeSnapshotContentList = append(newStatus.PVVolumeSnapshotContentList, crdv1alpha1.PVVolumeSnapshotContentPair{
 				VolumeSnapshotContentRef: v1.LocalObjectReference{
 					Name: snapshotContentLink.snapshotContentName,
 				},
 				PersistentVolumeRef: v1.LocalObjectReference{
-					Name: snapshotInfoList.GetFromVolumeHandle(snapshotContentLink.volumeHandle).PVName,
+					Name: pvName,
 				},
 			})
 		}
@@ -709,12 +706,23 @@ func (ctrl *csiSnapshotSideCarController) updateGroupSnapshotContentStatus(
 		}
 		if len(newStatus.PVVolumeSnapshotContentList) == 0 {
 			for _, snapshotContentLink := range snapshotContentLinks {
+				pv := utils.GetPersistentVolumeFromHandle(pvs, groupSnapshotContent.Spec.Driver, snapshotContentLink.volumeHandle)
+				pvName := ""
+				if pv != nil {
+					pvName = pv.Name
+				} else {
+					klog.V(5).Infof(
+						"updateGroupSnapshotContentStatus: unable to find PV for volumeHandle:[%s] and CSI driver:[%s] (existing status)",
+						snapshotContentLink.volumeHandle,
+						groupSnapshotContent.Spec.Driver)
+				}
+
 				newStatus.PVVolumeSnapshotContentList = append(newStatus.PVVolumeSnapshotContentList, crdv1alpha1.PVVolumeSnapshotContentPair{
 					VolumeSnapshotContentRef: v1.LocalObjectReference{
 						Name: snapshotContentLink.snapshotContentName,
 					},
 					PersistentVolumeRef: v1.LocalObjectReference{
-						Name: snapshotInfoList.GetFromVolumeHandle(snapshotContentLink.volumeHandle).PVName,
+						Name: pvName,
 					},
 				})
 			}
