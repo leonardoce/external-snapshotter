@@ -442,6 +442,14 @@ func (ctrl *csiSnapshotCommonController) syncUnreadyGroupSnapshot(groupSnapshot 
 			return err
 		}
 
+		// TODO(leonardoce): introduce a current context in this function
+		_, err = ctrl.createSnapshotsForGroupSnapshotContent(context.TODO(), newGroupSnapshotContent, groupSnapshot)
+		if err != nil {
+			klog.V(4).Infof("createSnapshotsForGroupSnapshotContent[%s]: failed to create snapshots and snapshotcontents for statically provisioned group snapshot %v: %v",
+				newGroupSnapshotContent.Name, groupSnapshot.Name, err.Error())
+			return err
+		}
+
 		return nil
 	}
 
@@ -470,7 +478,7 @@ func (ctrl *csiSnapshotCommonController) syncUnreadyGroupSnapshot(groupSnapshot 
 
 		updatedGroupSnapshot, err := ctrl.bindandUpdateVolumeGroupSnapshot(newGroupSnapshotContentObj, groupSnapshot)
 		if err != nil {
-			klog.V(4).Infof("bindandUpdateVolumeGroupSnapshot[%s]: failed to bind group snapshot content [%s] to group snapshot %v", uniqueGroupSnapshotName, contentObj.Name, err)
+			klog.V(4).Infof("bindandUpdateVolumeGroupSnapshot[%s]: failed to bind group snapshot content [%s] to dynamically provisioned group snapshot %v", uniqueGroupSnapshotName, contentObj.Name, err)
 			return err
 		}
 		klog.V(5).Infof("bindandUpdateVolumeGroupSnapshot %v", updatedGroupSnapshot)
@@ -501,8 +509,32 @@ func (ctrl *csiSnapshotCommonController) createSnapshotsForGroupSnapshotContent(
 ) (*crdv1alpha1.VolumeGroupSnapshotContent, error) {
 	// No status is present, or no volume snapshot was provisioned.
 	// Let's wait for the snapshotter sidecar to fill it.
-	if groupSnapshotContent.Status == nil || len(groupSnapshotContent.Status.VolumeSnapshotHandlePairList) == 0 {
+	if groupSnapshotContent.Status == nil {
 		return groupSnapshotContent, nil
+	}
+
+	var snapshotHandleVolumePairList []crdv1alpha1.VolumeSnapshotHandlePair
+	if groupSnapshot.Spec.Source.VolumeGroupSnapshotContentName == nil {
+		// For dynamically provisioned volume group snapshots, wait for the CSI
+		// snapshotter sidecar to fill groupSnapshotContent.Status.VolumeSnapshotHandlePairList
+		if len(groupSnapshotContent.Status.VolumeSnapshotHandlePairList) == 0 {
+			return groupSnapshotContent, nil
+		}
+
+		snapshotHandleVolumePairList = groupSnapshotContent.Status.VolumeSnapshotHandlePairList
+	} else {
+		// For statically provisioned volume group snapshots, we need the list of
+		// the individual volume snapshot handles
+		if groupSnapshotContent.Spec.Source.GroupSnapshotHandles == nil || len(groupSnapshotContent.Spec.Source.GroupSnapshotHandles.VolumeSnapshotHandles) == 0 {
+			return groupSnapshotContent, nil
+		}
+
+		snapshotHandleVolumePairList = make(
+			[]crdv1alpha1.VolumeSnapshotHandlePair,
+			len(groupSnapshotContent.Spec.Source.GroupSnapshotHandles.VolumeSnapshotHandles))
+		for i := range snapshotHandleVolumePairList {
+			snapshotHandleVolumePairList[i].VolumeHandle = groupSnapshotContent.Spec.Source.GroupSnapshotHandles.VolumeSnapshotHandles[i]
+		}
 	}
 
 	// The contents of the volume group snapshot class are needed to set the
@@ -536,9 +568,9 @@ func (ctrl *csiSnapshotCommonController) createSnapshotsForGroupSnapshotContent(
 
 	groupSnapshotContent.Status.PVVolumeSnapshotContentList = make(
 		[]crdv1alpha1.PVVolumeSnapshotContentPair,
-		len(groupSnapshotContent.Status.VolumeSnapshotHandlePairList),
+		len(snapshotHandleVolumePairList),
 	)
-	for i, snapshot := range groupSnapshotContent.Status.VolumeSnapshotHandlePairList {
+	for i, snapshot := range snapshotHandleVolumePairList {
 		snapshotHandle := snapshot.SnapshotHandle
 		volumeHandle := snapshot.VolumeHandle
 
@@ -551,11 +583,20 @@ func (ctrl *csiSnapshotCommonController) createSnapshotsForGroupSnapshotContent(
 				err)
 		}
 
-		volumeSnapshotContentName := getSnapshotContentNameForVolumeGroupSnapshotContent(
-			string(groupSnapshotContent.UID), volumeHandle)
+		var volumeSnapshotContentName string
+		var volumeSnapshotName string
 
-		volumeSnapshotName := getSnapshotNameForVolumeGroupSnapshotContent(
-			string(groupSnapshotContent.UID), volumeHandle)
+		if len(volumeHandle) > 0 {
+			volumeSnapshotContentName = getSnapshotContentNameForVolumeGroupSnapshotContent(
+				string(groupSnapshotContent.UID), volumeHandle)
+			volumeSnapshotName = getSnapshotNameForVolumeGroupSnapshotContent(
+				string(groupSnapshotContent.UID), volumeHandle)
+		} else {
+			volumeSnapshotContentName = getSnapshotContentNameForVolumeGroupSnapshotContent(
+				string(groupSnapshotContent.UID), snapshotHandle)
+			volumeSnapshotName = getSnapshotNameForVolumeGroupSnapshotContent(
+				string(groupSnapshotContent.UID), snapshotHandle)
+		}
 
 		volumeSnapshotNamespace := groupSnapshotContent.Spec.VolumeGroupSnapshotRef.Namespace
 
@@ -600,12 +641,14 @@ func (ctrl *csiSnapshotCommonController) createSnapshotsForGroupSnapshotContent(
 				Labels:     label,
 				Finalizers: []string{utils.VolumeSnapshotInGroupFinalizer},
 			},
-			Spec: crdv1.VolumeSnapshotSpec{
-				Source: crdv1.VolumeSnapshotSource{
-					PersistentVolumeClaimName: &pv.Spec.ClaimRef.Name,
-				},
-			},
+			Spec: crdv1.VolumeSnapshotSpec{},
 			// The status will be set by VolumeSnapshot reconciler
+		}
+
+		if pv != nil {
+			volumeSnapshot.Spec.Source.PersistentVolumeClaimName = &pv.Spec.ClaimRef.Name
+		} else {
+			volumeSnapshot.Spec.Source.VolumeSnapshotContentName = &volumeSnapshotContentName
 		}
 
 		_, err = ctrl.clientset.SnapshotV1().VolumeSnapshotContents().Create(ctx, volumeSnapshotContent, metav1.CreateOptions{})
@@ -720,14 +763,14 @@ func (ctrl *csiSnapshotCommonController) findPersistentVolumeByCSIDriverHandle(d
 }
 
 // getSnapshotNameForVolumeGroupSnapshotContent returns a unique snapshot name for a VolumeGroupSnapshotContent.
-func getSnapshotNameForVolumeGroupSnapshotContent(groupSnapshotContentUUID, volumeHandle string) string {
-	return fmt.Sprintf("snapshot-%x", sha256.Sum256([]byte(groupSnapshotContentUUID+volumeHandle)))
+func getSnapshotNameForVolumeGroupSnapshotContent(groupSnapshotContentUUID, handle string) string {
+	return fmt.Sprintf("snapshot-%x", sha256.Sum256([]byte(groupSnapshotContentUUID+handle)))
 }
 
 // getSnapshotContentNameForVolumeGroupSnapshotContent returns a unique content name for the
 // passed in VolumeGroupSnapshotContent.
-func getSnapshotContentNameForVolumeGroupSnapshotContent(groupSnapshotContentUUID, volumeHandle string) string {
-	return fmt.Sprintf("snapcontent-%x", sha256.Sum256([]byte(groupSnapshotContentUUID+volumeHandle)))
+func getSnapshotContentNameForVolumeGroupSnapshotContent(groupSnapshotContentUUID, handle string) string {
+	return fmt.Sprintf("snapcontent-%x", sha256.Sum256([]byte(groupSnapshotContentUUID+handle)))
 }
 
 // getPreprovisionedGroupSnapshotContentFromStore tries to find a pre-provisioned
