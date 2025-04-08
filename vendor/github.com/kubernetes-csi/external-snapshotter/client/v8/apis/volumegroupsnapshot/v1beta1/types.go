@@ -398,4 +398,35 @@ type VolumeSnapshotHandlePair struct {
 	// snapshot on the storage system
 	// Required.
 	SnapshotHandle string `json:"snapshotHandle" protobuf:"bytes,2,opt,name=snapshotHandle"`
+
+	// creationTime is the timestamp when the point-in-time snapshot is taken
+	// by the underlying storage system.
+	// In dynamic snapshot creation case, this field will be filled in by the
+	// CSI snapshotter sidecar with the "creation_time" value returned from CSI
+	// "CreateVolumeGroupSnapshot" gRPC call.
+	// If not specified, it indicates the creation time is unknown.
+	// The format of this field is a Unix nanoseconds time encoded as an int64.
+	// On Unix, the command `date +%s%N` returns the current time in nanoseconds
+	// since 1970-01-01 00:00:00 UTC.
+	// +optional
+	CreationTime *int64 `json:"creationTime,omitempty" protobuf:"varint,2,opt,name=creationTime"`
+
+	// restoreSize represents the complete size of the snapshot in bytes.
+	// In dynamic snapshot creation case, this field will be filled in by the
+	// CSI snapshotter sidecar with the "size_bytes" value returned from CSI
+	// "CreateVolumeGroupSnapshot" gRPC call.
+	// When restoring a volume from this snapshot, the size of the volume MUST NOT
+	// be smaller than the restoreSize if it is specified, otherwise the restoration will fail.
+	// If not specified, it indicates that the size is unknown.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	RestoreSize *int64 `json:"restoreSize,omitempty" protobuf:"bytes,3,opt,name=restoreSize"`
+
+	// readyToUse indicates if a snapshot is ready to be used to restore a volume.
+	// In dynamic snapshot creation case, this field will be filled in by the
+	// CSI snapshotter sidecar with the "ready_to_use" value returned from CSI
+	// "CreateVolumeGroupSnapshot" gRPC call.
+	// If not specified, it means the readiness of a snapshot is unknown.
+	// +optional.
+	ReadyToUse *bool `json:"readyToUse,omitempty" protobuf:"varint,4,opt,name=readyToUse"`
 }
